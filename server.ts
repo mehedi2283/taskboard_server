@@ -25,6 +25,16 @@ const userSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now },
 });
 
+const dynamicOptionsSchema = new mongoose.Schema({
+  global: { type: Boolean, default: true, unique: true },
+  priorities: [{ label: String, color: String }],
+  statuses: [{ label: String, color: String }],
+  categories: [{ label: String, color: String }],
+  assignees: [{ label: String, color: String }],
+}, { timestamps: true });
+
+const DynamicOptions = mongoose.model('DynamicOptions', dynamicOptionsSchema);
+
 const taskSchema = new mongoose.Schema({
   date: String,
   projectName: String,
@@ -289,6 +299,15 @@ async function startServer() {
     }
   };
 
+  const syncQueues: { [userId: string]: Promise<void> } = {};
+
+  const queueSyncToSheet = (userId: string, tasksToSync: any[], isFullSync = false) => {
+    const currentQueue = syncQueues[userId] || Promise.resolve();
+    syncQueues[userId] = currentQueue
+      .then(() => syncToSheet(userId, tasksToSync, isFullSync))
+      .catch((err) => console.error(`[Sync] Queue error for user ${userId}:`, err));
+  };
+
   // Robust Sheet ID extraction
   const rawSheetId = process.env.GOOGLE_SHEET_ID || '';
   const SPREADSHEET_ID = rawSheetId.includes('/d/')
@@ -351,7 +370,7 @@ async function startServer() {
       console.log(`[Sync All] User ${userId} requested full sync of ${tasks.length} tasks`);
 
       // Trigger sync (awaiting this one to provide feedback to UI)
-      await syncToSheet(userId, tasks, true);
+      await queueSyncToSheet(userId, tasks, true);
 
       res.json({ success: true, count: tasks.length });
     } catch (error: any) {
@@ -370,7 +389,7 @@ async function startServer() {
       await task.save();
 
       // Trigger background sync to sheet
-      syncToSheet(userId, [task]);
+      queueSyncToSheet(userId, [task]);
 
       res.status(201).json(serializeTask(task));
     } catch (error: any) {
@@ -411,7 +430,7 @@ async function startServer() {
       }
 
       // Trigger background sync to sheet
-      syncToSheet(userId, [task]);
+      queueSyncToSheet(userId, [task]);
 
       console.log(`[200] Task ${taskId} updated successfully`);
       res.json(serializeTask(task));
@@ -450,7 +469,7 @@ async function startServer() {
       }
 
       // Trigger background sync for delete
-      syncToSheet(userId, [{ id: taskId, _deleted: true }]);
+      queueSyncToSheet(userId, [{ id: taskId, _deleted: true }]);
 
       console.log(`[200] Task ${taskId} deleted successfully`);
       res.json({ success: true });
@@ -677,6 +696,74 @@ async function startServer() {
       res.json({ takenDepartments });
     } catch (error: any) {
       console.error('Error fetching taken departments:', error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // --- Dynamic Options Endpoints ---
+
+  app.get('/api/options', authenticateToken, async (req, res) => {
+    try {
+      let options = await DynamicOptions.findOne({ global: true });
+      if (!options) {
+        // Seed default options
+        options = new DynamicOptions({
+          global: true,
+          priorities: [
+            { label: 'Urgent', color: 'bg-red-500 text-white border-red-600' },
+            { label: 'High', color: 'bg-orange-500 text-white border-orange-600' },
+            { label: 'Medium', color: 'bg-blue-500 text-white border-blue-600' },
+            { label: 'Low', color: 'bg-emerald-500 text-white border-emerald-600' }
+          ],
+          statuses: [
+            { label: 'To Do', color: 'bg-red-100 text-red-700 border-red-200' },
+            { label: 'In Progress', color: 'bg-amber-100 text-amber-700 border-amber-200' },
+            { label: 'Completed', color: 'bg-emerald-100 text-emerald-700 border-emerald-200' }
+          ],
+          categories: [
+            { label: 'Development', color: 'bg-purple-500 text-white border-purple-600' },
+            { label: 'Design', color: 'bg-pink-500 text-white border-pink-600' },
+            { label: 'Marketing', color: 'bg-indigo-500 text-white border-indigo-600' },
+            { label: 'Research', color: 'bg-cyan-500 text-white border-cyan-600' },
+            { label: 'Admin', color: 'bg-slate-500 text-white border-slate-600' },
+            { label: 'Meeting', color: 'bg-rose-500 text-white border-rose-600' },
+            { label: 'General', color: 'bg-emerald-500 text-white border-emerald-600' }
+          ],
+          assignees: [
+            { label: 'Alex', color: 'bg-[#eff6ff] text-[#1e40af] border-[#dbeafe]' },
+            { label: 'Jordan', color: 'bg-[#fef2f2] text-[#991b1b] border-[#fee2e2]' },
+            { label: 'Taylor', color: 'bg-[#f0fdf4] text-[#166534] border-[#dcfce7]' },
+            { label: 'Morgan', color: 'bg-[#faf5ff] text-[#6b21a8] border-[#f3e8ff]' },
+            { label: 'Casey', color: 'bg-[#fffbeb] text-[#92400e] border-[#fef3c7]' }
+          ]
+        });
+        await options.save();
+      }
+      res.json(options);
+    } catch (error: any) {
+      console.error('Error fetching options:', error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.put('/api/options', authenticateToken, async (req: any, res) => {
+    try {
+      const currentUser = req.user;
+      if (!['superadmin', 'project_manager', 'team_leader'].includes(currentUser.role)) {
+        return res.status(403).json({ error: 'Unauthorized to modify options' });
+      }
+
+      const { priorities, statuses, categories, assignees } = req.body;
+
+      const updatedOptions = await DynamicOptions.findOneAndUpdate(
+        { global: true },
+        { priorities, statuses, categories, assignees },
+        { new: true, upsert: true }
+      );
+
+      res.json(updatedOptions);
+    } catch (error: any) {
+      console.error('Error updating options:', error);
       res.status(500).json({ error: error.message });
     }
   });
