@@ -90,17 +90,37 @@ async function startServer() {
   };
 
   // Google Sheets Auth (Default from Env)
-  const getAuth = (email?: string, key?: string) => {
-    const formattedKey = cleanKey(key);
-    if (!email || !formattedKey) return null;
+  // Google Sheets Auth
+  const getAuth = (email?: string, key?: string, jsonCredentials?: string) => {
     try {
+      // 1. If JSON credentials provided (entire file pasted in settings)
+      if (jsonCredentials) {
+        try {
+          const creds = JSON.parse(jsonCredentials);
+          if (creds.client_email && creds.private_key) {
+            console.log('Using parsed JSON credentials for auth');
+            return new google.auth.JWT({
+              email: creds.client_email,
+              key: creds.private_key,
+              scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+            });
+          }
+        } catch (je) {
+          // Not valid JSON, fall back
+        }
+      }
+
+      // 2. Fallback to discrete email/key
+      const formattedKey = cleanKey(key);
+      if (!email || !formattedKey) return null;
+
       return new google.auth.JWT({
         email,
         key: formattedKey,
         scopes: ['https://www.googleapis.com/auth/spreadsheets'],
       });
-    } catch (e) {
-      console.error('Auth Initialization Error:', e);
+    } catch (e: any) {
+      console.error('Auth Initialization Error:', e.message);
       return null;
     }
   };
@@ -110,19 +130,40 @@ async function startServer() {
 
   // Robust Sheet Sync Helper
   const syncToSheet = async (userId: string, tasksToSync: any[] = []) => {
+    if (!userId || tasksToSync.length === 0) return;
+
     try {
       const user = await User.findById(userId);
-      if (!user || !user.googleSheetId) return;
+      if (!user) {
+        console.log(`[Sync] User ${userId} not found`);
+        return;
+      }
 
-      const userAuth = getAuth(process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL, process.env.GOOGLE_PRIVATE_KEY);
-      if (!userAuth) return;
+      if (!user.googleSheetId) {
+        console.log(`[Sync] User ${user.email} has no googleSheetId configured`);
+        return;
+      }
+
+      console.log(`[Sync] Starting sync for user ${user.email} to sheet ${user.googleSheetId}`);
+
+      // Robust Sheet ID extraction from URL if needed
+      const spreadsheetId = user.googleSheetId.includes('/d/')
+        ? user.googleSheetId.split('/d/')[1].split('/')[0]
+        : user.googleSheetId.trim();
+
+      // Prioritize user-provided credentials from DB, then fall back to ENV
+      const userAuth = getAuth(
+        process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
+        process.env.GOOGLE_PRIVATE_KEY,
+        user.googleCredentials
+      );
+
+      if (!userAuth) {
+        console.error(`[Sync] Authentication failed: No valid credentials for user ${user.email}`);
+        return;
+      }
 
       const userSheets = google.sheets({ version: 'v4', auth: userAuth });
-
-      // If tasksToSync is empty, fetch all from DB?
-      // For now, let's assume we want to push the provided tasks.
-      // The user requested that "too add task there must be a linked sheet"
-      // This implies we should be syncing.
 
       const rows = tasksToSync.map(t => [
         t.date || '',
@@ -139,20 +180,25 @@ async function startServer() {
         t.id || (t._id ? t._id.toString() : '')
       ]);
 
-      if (rows.length === 0) return;
+      // Use a generic range for append. We might want to specify a sheet name.
+      const range = 'Sheet1!A2';
 
-      // This is a simple append for now. 
-      // In a real "from scratch" system, we might want to mirror DB exactly.
-      await userSheets.spreadsheets.values.append({
-        spreadsheetId: user.googleSheetId,
-        range: 'Sheet1!A2',
-        valueInputOption: 'RAW',
-        requestBody: { values: rows },
-      });
-
-      console.log(`Synced ${rows.length} tasks to sheet ${user.googleSheetId}`);
-    } catch (error) {
-      console.error('Error syncing to sheet:', error);
+      try {
+        await userSheets.spreadsheets.values.append({
+          spreadsheetId: spreadsheetId,
+          range: range,
+          valueInputOption: 'RAW',
+          requestBody: { values: rows },
+        });
+        console.log(`[Sync] SUCCESS: Appended ${rows.length} rows to sheet ${spreadsheetId}`);
+      } catch (sheetError: any) {
+        console.error(`[Sync] Google Sheets API Error: ${sheetError.message}`);
+        if (sheetError.message.includes('not found')) {
+          console.error(`[Sync] Hint: Check if the spreadsheet ID is correct and shared with the service account email.`);
+        }
+      }
+    } catch (error: any) {
+      console.error('[Sync] Unexpected error during sync process:', error.message);
     }
   };
 
