@@ -129,7 +129,7 @@ async function startServer() {
   const sheets = google.sheets({ version: 'v4', auth: defaultAuth || undefined });
 
   // Robust Sheet Sync Helper
-  const syncToSheet = async (userId: string, tasksToSync: any[] = []) => {
+  const syncToSheet = async (userId: string, tasksToSync: any[] = [], isFullSync: boolean = false) => {
     if (!userId || tasksToSync.length === 0) return;
 
     try {
@@ -140,11 +140,11 @@ async function startServer() {
       }
 
       if (!user.googleSheetId) {
-        console.log(`[Sync] User ${user.email} has no googleSheetId configured`);
+        console.log(`[Sync] User ${user.email} has no googleSheetId configured. Skipping sync.`);
         return;
       }
 
-      console.log(`[Sync] Starting sync for user ${user.email} to sheet ${user.googleSheetId}`);
+      console.log(`[Sync] Starting ${isFullSync ? 'FULL' : 'INCREMENTAL'} sync for user ${user.email} to sheet ${user.googleSheetId}`);
 
       // Robust Sheet ID extraction from URL if needed
       const spreadsheetId = user.googleSheetId.includes('/d/')
@@ -165,36 +165,123 @@ async function startServer() {
 
       const userSheets = google.sheets({ version: 'v4', auth: userAuth });
 
-      const rows = tasksToSync.map(t => [
-        t.date || '',
-        t.projectName || '',
-        t.description || '',
-        t.priority || '',
-        t.startTime || '',
-        t.dueTime || '',
-        t.status || '',
-        (t.assignedPerson || []).join(', '),
-        t.category || '',
-        t.timeSpent || 0,
-        t.notes || '',
-        t.id || (t._id ? t._id.toString() : '')
-      ]);
+      if (isFullSync) {
+        // Clear existing data from row 2 downward
+        try {
+          await userSheets.spreadsheets.values.clear({
+            spreadsheetId,
+            range: 'Sheet1!A2:L',
+          });
+          console.log(`[Sync] Cleared existing data in Sheet1!A2:L for full sync.`);
+        } catch (clearErr: any) {
+          console.log(`[Sync] Note: Could not clear existing data (might be empty already).`);
+        }
 
-      // Use a generic range for append. We might want to specify a sheet name.
-      const range = 'Sheet1!A2';
+        const rows = tasksToSync.map(t => [
+          t.date || '',
+          t.projectName || '',
+          t.description || '',
+          t.priority || '',
+          t.startTime || '',
+          t.dueTime || '',
+          t.status || '',
+          (t.assignedPerson || []).join(', '),
+          t.category || '',
+          t.timeSpent || 0,
+          t.notes || '',
+          t.id || (t._id ? t._id.toString() : '')
+        ]);
 
-      try {
-        await userSheets.spreadsheets.values.append({
-          spreadsheetId: spreadsheetId,
-          range: range,
-          valueInputOption: 'RAW',
-          requestBody: { values: rows },
-        });
-        console.log(`[Sync] SUCCESS: Appended ${rows.length} rows to sheet ${spreadsheetId}`);
-      } catch (sheetError: any) {
-        console.error(`[Sync] Google Sheets API Error: ${sheetError.message}`);
-        if (sheetError.message.includes('not found')) {
-          console.error(`[Sync] Hint: Check if the spreadsheet ID is correct and shared with the service account email.`);
+        try {
+          console.log(`[Sync] Attempting to append all ${rows.length} rows to ${spreadsheetId}`);
+          await userSheets.spreadsheets.values.append({
+            spreadsheetId,
+            range: 'Sheet1!A2',
+            valueInputOption: 'RAW',
+            requestBody: { values: rows },
+          });
+          console.log(`[Sync] SUCCESS: Appended ${rows.length} rows to sheet ${spreadsheetId}`);
+        } catch (sheetError: any) {
+          console.error(`[Sync] Google Sheets API Error: ${sheetError.message}`);
+          if (sheetError.message.includes('not found')) {
+            console.error(`[Sync] Hint: Check if the spreadsheet ID is correct and shared with the service account email.`);
+          } else if (sheetError.message.includes('permission')) {
+            console.error(`[Sync] Hint: Ensure the service account has Editor access to the sheet.`);
+          }
+        }
+      } else {
+        // Incremental sync
+        let existingValues: any[][] = [];
+        try {
+          const getRes = await userSheets.spreadsheets.values.get({
+            spreadsheetId,
+            range: 'Sheet1!A:L',
+          });
+          existingValues = getRes.data.values || [];
+        } catch (err: any) {
+          console.log(`[Sync] Could not fetch existing sheet data to find duplicates.`);
+        }
+
+        for (const t of tasksToSync) {
+          const taskId = t.id || (t._id ? t._id.toString() : '');
+
+          let rowIndex = -1;
+          for (let i = 0; i < existingValues.length; i++) {
+            if (existingValues[i] && existingValues[i][11] === taskId) {
+              rowIndex = i + 1; // Google sheets rows are 1-indexed
+              break;
+            }
+          }
+
+          if (t._deleted) {
+            if (rowIndex !== -1) {
+              try {
+                await userSheets.spreadsheets.values.clear({
+                  spreadsheetId,
+                  range: `Sheet1!A${rowIndex}:L${rowIndex}`
+                });
+                console.log(`[Sync] SUCCESS: Cleared row ${rowIndex} (Task deleted).`);
+              } catch (e) { }
+            }
+            continue;
+          }
+
+          const rowData = [
+            t.date || '',
+            t.projectName || '',
+            t.description || '',
+            t.priority || '',
+            t.startTime || '',
+            t.dueTime || '',
+            t.status || '',
+            (t.assignedPerson || []).join(', '),
+            t.category || '',
+            t.timeSpent || 0,
+            t.notes || '',
+            taskId
+          ];
+
+          try {
+            if (rowIndex !== -1) {
+              await userSheets.spreadsheets.values.update({
+                spreadsheetId,
+                range: `Sheet1!A${rowIndex}:L${rowIndex}`,
+                valueInputOption: 'RAW',
+                requestBody: { values: [rowData] }
+              });
+              console.log(`[Sync] SUCCESS: Updated row ${rowIndex} for task ${taskId}.`);
+            } else {
+              await userSheets.spreadsheets.values.append({
+                spreadsheetId,
+                range: 'Sheet1!A2',
+                valueInputOption: 'RAW',
+                requestBody: { values: [rowData] }
+              });
+              console.log(`[Sync] SUCCESS: Appended new row for task ${taskId}.`);
+            }
+          } catch (sheetError: any) {
+            console.error(`[Sync] Error updating/appending task: ${sheetError.message}`);
+          }
         }
       }
     } catch (error: any) {
@@ -247,6 +334,28 @@ async function startServer() {
       const tasks = await Task.find({ userId }).sort({ createdAt: -1 });
       res.json(tasks);
     } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // Bulk sync all tasks to Google Sheet
+  app.post('/api/tasks/sync-all', authenticateToken, async (req: any, res) => {
+    try {
+      const userId = req.user.id;
+      const tasks = await Task.find({ userId }).sort({ createdAt: 1 });
+
+      if (tasks.length === 0) {
+        return res.json({ success: true, message: 'No tasks to sync' });
+      }
+
+      console.log(`[Sync All] User ${userId} requested full sync of ${tasks.length} tasks`);
+
+      // Trigger sync (awaiting this one to provide feedback to UI)
+      await syncToSheet(userId, tasks, true);
+
+      res.json({ success: true, count: tasks.length });
+    } catch (error: any) {
+      console.error('[Sync All] Error:', error.message);
       res.status(500).json({ error: error.message });
     }
   });
@@ -339,6 +448,9 @@ async function startServer() {
         console.log(`[404] Task ${taskId} not found for deletion`);
         return res.status(404).json({ error: 'Task not found' });
       }
+
+      // Trigger background sync for delete
+      syncToSheet(userId, [{ id: taskId, _deleted: true }]);
 
       console.log(`[200] Task ${taskId} deleted successfully`);
       res.json({ success: true });
